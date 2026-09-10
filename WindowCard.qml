@@ -88,10 +88,12 @@ Rectangle {
                 card.controller.hoveredIndex = -1;
 
         }
-        acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+        acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
         onClicked: function(mouse) {
             if (mouse.button === Qt.MiddleButton)
                 card.controller.requestClose(card.modelData);
+            else if (mouse.button === Qt.RightButton)
+                card.controller.toggleWorkspaceScope();
             else
                 card.controller.activate(card.modelData);
         }

@@ -1871,7 +1871,12 @@ Item {
 
                 MouseArea {
                     anchors.fill: parent
-                    onClicked: {
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    onClicked: function (mouse) {
+                        if (mouse.button === Qt.RightButton) {
+                            root.toggleWorkspaceScope();
+                            return;
+                        }
                         if (root.previewIndex >= 0 || root.previewExitIndex >= 0)
                             root.clearPreview();
                         else
@@ -2024,7 +2029,7 @@ Item {
                         visible: root.showFooter
 
                         Text {
-                            text: "← ↑ ↓ → navigate   Space preview   Tab scope   Shift+Q close   Enter open   Esc close"
+                            text: "← ↑ ↓ → navigate   Space preview   Tab / right-click scope   Shift+Q close   Enter open   Esc close"
                             textFormat: Text.PlainText
                             color: Color.menu.text
                             opacity: 0.55

@@ -16,7 +16,15 @@ fi
 [[ $address =~ ^0x[0-9a-fA-F]+$ ]] || exit 2
 
 # Let the layer-shell surface unmap before taking final compositor focus.
-sleep 0.2
+# Poll for the actual unmap rather than sleeping a flat 0.2s: the surface is
+# normally gone within a frame or two, and a check costs ~2ms, so activation
+# stops paying 200ms every time for a wait that is almost never needed. The
+# iteration cap must outlast the overlay's fade-out (~226ms), or the poll
+# expires mid-animation and focuses before the unmap - the case it guards.
+for _ in $(seq 1 60); do
+  hyprctl layers 2>/dev/null | grep -q "expose-window-overview" || break
+  sleep 0.005
+done
 
 if [[ $move_cursor != "true" ]]; then
   cursor_position=$(hyprctl cursorpos 2>/dev/null || true)

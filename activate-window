@@ -33,6 +33,11 @@ fi
 
 hyprctl eval "hl.dispatch(hl.dsp.focus({ window = 'address:$address' }))" >/dev/null
 
+# Focus alone does not restack. Tiled windows never overlap so it goes unnoticed,
+# but a floating window activated from the overview takes input while still
+# sitting behind whatever it overlaps.
+hyprctl eval "hl.dispatch(hl.dsp.window.bring_to_top({ window = 'address:$address' }))" >/dev/null
+
 if [[ -n ${cursor_x:-} && -n ${cursor_y:-} ]]; then
   hyprctl eval "hl.dispatch(hl.dsp.cursor.move({ x = $cursor_x, y = $cursor_y }))" >/dev/null
 fi

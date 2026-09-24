@@ -113,6 +113,13 @@ Item {
         return isFinite(value) ? Math.max(0, Math.min(90, Math.round(value))) : 6;
     }
     readonly property bool hotCornerEnabled: !root.pluginEntry || root.pluginEntry.hotCornerEnabled !== false
+    // Local patch: the hot corner sits exactly where a full-screen game wants
+    // the cursor, so a flick to the edge yanked the overview over the game.
+    // Rather than turning the corner off by hand before every session, scan for
+    // a running game and take the corner out of the way while one is up. Only
+    // the corner is gated: an explicit keybind or IPC call still opens the
+    // overview on purpose, and the corner still closes one that is open.
+    property bool gameSessionActive: false
     readonly property var hotCornerPositions: ["top-left", "top-right", "bottom-left", "bottom-right"]
     readonly property string hotCornerPosition: {
         var position = String((root.pluginEntry && root.pluginEntry.hotCornerPosition) || "top-left");
@@ -680,14 +687,80 @@ Item {
         return false;
     }
 
+    // Detection is self-contained. Reading it off another plugin's service
+    // worked, but a corner that only behaves while a second, unrelated plugin
+    // happens to be installed is a dependency this one should not carry - and
+    // that plugin is the more ephemeral of the two.
+    //
+    // Polled only while the corner is enabled: with the corner off there is
+    // nothing to gate, so nothing runs.
+    Timer {
+        interval: 5000
+        running: root.hotCornerEnabled
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: if (!gameDetectProcess.running) gameDetectProcess.running = true
+    }
+
+    // A game that stops reporting for a single poll is almost always a loading
+    // screen or a process the scan briefly missed, not a session that ended.
+    // Remapping the corner underneath a running game is the whole failure this
+    // patch exists to prevent, so ending waits out a grace period that starting
+    // deliberately does not.
+    Timer {
+        id: gameEndGrace
+        interval: 15000
+        repeat: false
+        onTriggered: root.gameSessionActive = false
+    }
+
+    Process {
+        id: gameDetectProcess
+        property bool warned: false
+        command: ["bash", root.pluginDir + "/game-detect.sh"]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var answer = String(text).trim();
+                if (answer !== "0" && answer !== "1") {
+                    // Anything else means the scan did not run - script missing
+                    // or no shell to run it. Failing open is right, an
+                    // unreadable scan must not cost anyone the hot corner, but
+                    // it is silent, so say it once: the visible symptom is the
+                    // corner arming mid-game with nothing to explain it.
+                    if (!gameDetectProcess.warned) {
+                        gameDetectProcess.warned = true;
+                        console.warn("expose: game-detect.sh produced no usable answer"
+                            + "; the hot corner will not be gated during games");
+                    }
+                    return;
+                }
+                if (answer === "1") {
+                    gameEndGrace.stop();
+                    root.gameSessionActive = true;
+                } else if (root.gameSessionActive && !gameEndGrace.running) {
+                    gameEndGrace.restart();
+                }
+            }
+        }
+    }
+
     function triggerHotCorner(screenName) {
         if (!root.hotCornerEnabled || !root.hotCornerArmed)
             return;
-        root.hotCornerArmed = false;
+        // Closing stays available even mid-game: the overview can only be open
+        // here because a keybind or IPC call opened it deliberately, and the
+        // corner is its documented toggle.
         if (root.opened || root.openingPending) {
+            root.hotCornerArmed = false;
             root.dismiss();
             return;
         }
+        // Leaves the corner armed, so it is live the moment the game ends
+        // rather than waiting on an exit that unmapped surfaces cannot deliver.
+        if (root.gameSessionActive)
+            return;
+        root.hotCornerArmed = false;
         var name = String(screenName || "");
         if (name) {
             root.overviewScreenPinned = true;
@@ -1688,7 +1761,11 @@ Item {
     // other displays remain disabled until the overview unmounts.
     Variants {
         id: hotCornerInstances
-        model: root.hotCornerEnabled ? Quickshell.screens : []
+        // Gated on the game session too, not just the trigger: this window
+        // carries an input region over the corner strip, so leaving it mapped
+        // would still pull pointer focus off a full-screen game and swallow
+        // clicks that land in the strip.
+        model: root.hotCornerEnabled && !root.gameSessionActive ? Quickshell.screens : []
 
         PanelWindow { // qmllint disable uncreatable-type
             required property var modelData

@@ -722,19 +722,24 @@ Item {
             waitForEnd: true
             onStreamFinished: {
                 var answer = String(text).trim();
-                if (answer !== "0" && answer !== "1") {
+                var usable = answer === "0" || answer === "1";
+                if (!usable) {
                     // Anything else means the scan did not run - script missing
-                    // or no shell to run it. Failing open is right, an
-                    // unreadable scan must not cost anyone the hot corner, but
-                    // it is silent, so say it once: the visible symptom is the
-                    // corner arming mid-game with nothing to explain it.
+                    // or no shell to run it. It is silent, so say it once: the
+                    // visible symptom is the corner arming mid-game with
+                    // nothing to explain it.
                     if (!gameDetectProcess.warned) {
                         gameDetectProcess.warned = true;
                         console.warn("expose: game-detect.sh produced no usable answer"
                             + "; the hot corner will not be gated during games");
                     }
-                    return;
                 }
+                // "I cannot tell" and "no game" release the corner alike. An
+                // unreadable scan must not cost anyone the hot corner, and
+                // returning early here instead would only fail open from a cold
+                // start: break the scan while a session is up and the corner
+                // would stay unmapped for the rest of the shell's life, long
+                // after the game exits.
                 if (answer === "1") {
                     gameEndGrace.stop();
                     root.gameSessionActive = true;
@@ -780,6 +785,17 @@ Item {
 
     onHotCornerEnabledChanged: {
         if (!root.hotCornerEnabled) {
+            hotCornerRearm.stop();
+            root.hotCornerArmed = true;
+        }
+    }
+
+    // Same reset as disabling the corner, and for the same reason: the surfaces
+    // that deliver the exit event which re-arms the corner are gone while a game
+    // is up. Trigger the corner, have a game start before the exit lands, and
+    // the flag would still be false when the corner comes back.
+    onGameSessionActiveChanged: {
+        if (!root.gameSessionActive) {
             hotCornerRearm.stop();
             root.hotCornerArmed = true;
         }

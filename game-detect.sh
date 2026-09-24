@@ -13,10 +13,15 @@
 # launcher inventory and its jq dependency are dropped.
 set -uo pipefail
 
-if grep -qz '^SteamAppId=' /proc/[0-9]*/environ 2>/dev/null \
-  || grep -qz '^LUTRIS_GAME_UUID=' /proc/[0-9]*/environ 2>/dev/null \
-  || grep -qaz 'WINEPREFIX=.*[Hh]eroic' /proc/[0-9]*/environ 2>/dev/null \
-  || grep -qaz 'WINEPREFIX=.*/bottles/' /proc/[0-9]*/environ 2>/dev/null; then
+# The Heroic and Bottles patterns match those launchers' default prefix layout.
+# A prefix relocated somewhere without the launcher's name in the path is a miss,
+# as is a game started straight from a shell with no launcher to stamp it. Both
+# are inherent to reading the environment rather than guessing at process names,
+# and both fail towards leaving the hot corner alone.
+if grep -qaz '^SteamAppId=' /proc/[0-9]*/environ 2>/dev/null \
+  || grep -qaz '^LUTRIS_GAME_UUID=' /proc/[0-9]*/environ 2>/dev/null \
+  || grep -qaz '^WINEPREFIX=.*[Hh]eroic' /proc/[0-9]*/environ 2>/dev/null \
+  || grep -qaz '^WINEPREFIX=.*/bottles/' /proc/[0-9]*/environ 2>/dev/null; then
   echo 1
 else
   echo 0

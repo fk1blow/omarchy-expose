@@ -9,10 +9,13 @@ macOS-style Exposé for Omarchy: one key or a hot corner shows every open window
 - **Live previews.** Cards are real screencopy views, so videos keep playing and terminals keep scrolling. The Omarchy desktop behind the grid stays live too.
 - **Quick Look.** Space enlarges any preview and restores it again. Shift+Space does it in slow motion, like the classic macOS Easter egg.
 - **Search.** Just start typing to filter windows by title or application.
-- **Workspace scope.** Press Tab to switch between every window and windows on the current workspace. Per-monitor mode evaluates the current workspace of the selected display.
+- **Workspace scope.** Defaults to the current workspace. Press Tab to switch between every window and windows on the current workspace. Per-monitor mode evaluates the current workspace of the selected display.
+- **Layout modes.** Adaptive (the original, which maximizes window size) or Grid (a macOS Exposé-style grid that distributes windows evenly based on a sqrt-based formula with aspect-ratio awareness).
 - **Multi-monitor layouts.** The overview opens only on the focused display (or the display whose hot corner was used). Same overview shows every window there; per monitor keeps that display's own windows.
 - **Built for Omarchy.** Runs inside Omarchy Shell, follows the active theme, and adds no packages, services, or daemons.
 - **Hot corner.** Toggle the overview by flinging the pointer into a corner (on by default, any corner, can be disabled).
+
+See [docs/grid-layout.md](docs/grid-layout.md) for full details on the Grid layout algorithm and its macOS Exposé inspiration.
 
 Everything is tunable from the built-in Settings panel and over IPC, and changes apply instantly.
 
@@ -99,6 +102,7 @@ Open **Settings** from the footer while the overview is open. It is fully keyboa
 - Bottom text visibility. Hiding it requires confirmation and removes the Settings link
 - Hot corner on/off and position (disable the same corner in other hot-corner plugins to avoid overlap)
 - Move cursor to the activated window on/off
+- Default workspace scope (current or all) and layout mode saved in the plugin entry
 
 Every reversible setting is also scriptable:
 
@@ -120,6 +124,8 @@ omarchy-shell expose multiMonitorMode mirrored   # mirrored | per-monitor
 omarchy-shell expose hotCorner on                # on | off
 omarchy-shell expose hotCornerPosition top-left  # top-left | top-right | bottom-left | bottom-right
 omarchy-shell expose moveCursorToWindow on       # on | off
+omarchy-shell expose workspaceScope current      # current | all
+omarchy-shell expose layoutMode grid             # adaptive | grid
 ```
 
 After hiding the bottom text, you can restore it while Settings remains open. If you close Settings first, edit `~/.config/omarchy/shell.json` and set `"showFooter": true` in the `expose.window-overview` plugin entry.

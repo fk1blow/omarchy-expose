@@ -1115,6 +1115,56 @@ Item {
                             }
 
                             SettingsDivider { Layout.fillWidth: true }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: Style.space(48)
+                                Text {
+                                    Layout.preferredWidth: Style.space(120)
+                                    text: "Scope"
+                                    textFormat: Text.PlainText
+                                    color: Color.menu.text
+                                    font.family: Style.font.menuFamily
+                                    font.pixelSize: Style.font.body
+                                }
+                                Item { Layout.fillWidth: true }
+                                SettingChoices {
+                                    id: workspaceScopeChoices
+                                    value: settingsView.controller.workspaceScope
+                                    options: [
+                                        { label: "Current workspace", value: "current" },
+                                        { label: "All workspaces", value: "all" }
+                                    ]
+                                    onChosen: function (value) { settingsView.controller.setWorkspaceScope(value); }
+                                }
+                            }
+
+                            SettingsDivider { Layout.fillWidth: true }
+
+                            RowLayout {
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: Style.space(48)
+                                Text {
+                                    Layout.preferredWidth: Style.space(120)
+                                    text: "Layout"
+                                    textFormat: Text.PlainText
+                                    color: Color.menu.text
+                                    font.family: Style.font.menuFamily
+                                    font.pixelSize: Style.font.body
+                                }
+                                Item { Layout.fillWidth: true }
+                                SettingChoices {
+                                    id: layoutModeChoices
+                                    value: settingsView.controller.layoutMode
+                                    options: [
+                                        { label: "Adaptive", value: "adaptive" },
+                                        { label: "Grid", value: "grid" }
+                                    ]
+                                    onChosen: function (value) { settingsView.controller.setLayoutMode(value); }
+                                }
+                            }
+
+                            SettingsDivider { Layout.fillWidth: true }
                             Item { Layout.fillHeight: true }
                         }
                     }

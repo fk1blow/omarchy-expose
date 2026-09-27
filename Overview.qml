@@ -140,7 +140,8 @@ Item {
     property bool surfaceMounted: false
     property bool hotCornerArmed: true
     property string filterText: ""
-    property string workspaceScope: "all"
+    property string workspaceScope: (root.pluginEntry && root.pluginEntry.workspaceScope === "all") ? "all" : "current"
+    readonly property string layoutMode: root.pluginEntry && root.pluginEntry.layoutMode === "grid" ? "grid" : "adaptive"
     property int selectedIndex: 0
     property int hoveredIndex: -1
     property int previewIndex: -1
@@ -250,7 +251,6 @@ Item {
             root.backgroundBlurReleasePhase = 0;
         root.closeSettings();
         root.filterText = "";
-        root.workspaceScope = "all";
         root.dismissNotifyShell = false;
         if (root.surfaceMounted) {
             if (blurRestoreInFlight) {
@@ -657,6 +657,12 @@ Item {
             root.updatePluginSetting("multiMonitorMode", mode);
     }
 
+    function setLayoutMode(value) {
+        var mode = value === "grid" ? "grid" : "adaptive";
+        if (mode !== root.layoutMode)
+            root.updatePluginSetting("layoutMode", mode);
+    }
+
     function requestFooterHide() {
         if (!root.showFooter)
             return;
@@ -872,9 +878,10 @@ Item {
 
     function setWorkspaceScope(value) {
         var next = value === "current" ? "current" : "all";
-        if (next === "current" && !root.workspaceForScreen(root.keyboardScreenName))
-            return;
         if (next === root.workspaceScope)
+            return;
+        root.updatePluginSetting("workspaceScope", next);
+        if (next === "current" && !root.workspaceForScreen(root.keyboardScreenName))
             return;
         root.workspaceScope = next;
         root.hoveredIndex = -1;
@@ -1291,6 +1298,103 @@ Item {
         }
         if (!best)
             best = root.composeRows(root.assignCompositionRows(entries, 1), 1, availableWidth, availableHeight, gap, padding, footerHeight) || [];
+        for (var resultIndex = 0; resultIndex < best.length; resultIndex++) {
+            if (!best[resultIndex])
+                continue;
+            best[resultIndex].x += edgeInset;
+            best[resultIndex].y += edgeInset;
+        }
+        return best;
+    }
+
+    function distributeGridRows(entries, rowCount) {
+        var rows = [];
+        for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
+            rows.push({ entries: [], naturalWidth: 0 });
+        var perRow = Math.ceil(entries.length / rowCount);
+        for (var entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+            var row = Math.min(Math.floor(entryIndex / perRow), rowCount - 1);
+            rows[row].entries.push(entries[entryIndex]);
+            rows[row].naturalWidth += Math.sqrt(entries[entryIndex].weight * entries[entryIndex].ratio);
+        }
+        for (var sortRow = 0; sortRow < rows.length; sortRow++)
+            rows[sortRow].entries.sort(function (a, b) { return a.index - b.index; });
+        return rows;
+    }
+
+    function computeGridLayout(toplevels, width, height, gap, padding, footerHeight, viewportRatioHint) {
+        var count = toplevels.length;
+        if (!count || width <= 0 || height <= 0)
+            return [];
+
+        var edgeInset = gap / 2;
+        var availableWidth = Math.max(1, width - edgeInset * 2);
+        var availableHeight = Math.max(1, height - edgeInset * 2);
+
+        var entries = [];
+        for (var index = 0; index < count; index++) {
+            var ratio = root.aspectRatioFor(toplevels[index]);
+            entries.push({
+                index: index,
+                ratio: ratio,
+                weight: Math.max(0.72, Math.min(1.28, Math.sqrt(ratio / 1.6))),
+                extremity: Math.max(ratio, 1 / ratio)
+            });
+        }
+        entries.sort(function (a, b) {
+            if (a.extremity !== b.extremity)
+                return b.extremity - a.extremity;
+            return a.index - b.index;
+        });
+
+        // macOS Exposé-style grid (US Patent 8,612,883):
+        //   columns = round(sqrt(count * viewportRatio)), rows = ceil(count / columns)
+        var viewportRatio = Number(viewportRatioHint);
+        if (!isFinite(viewportRatio) || viewportRatio <= 0)
+            viewportRatio = availableWidth / availableHeight;
+
+        var sqrtCols = Math.max(1, Math.round(Math.sqrt(count * viewportRatio)));
+        var estimatedRows = Math.ceil(count / sqrtCols);
+
+        // Row limits: at least 2 rows for 4+ windows (grid preference), at most what fits
+        var footerSpacing = footerHeight > 0 ? padding : 0;
+        var minimumCardHeight = footerHeight + padding * 2 + footerSpacing + 1;
+        var maxRows = Math.max(1, Math.min(count, Math.floor((availableHeight + gap) / (minimumCardHeight + gap))));
+        var minRows = Math.max(1, Math.min(maxRows, estimatedRows));
+        if (count >= 4 && minRows === 1)
+            minRows = 2;
+
+        // Try each row count from minRows to maxRows, picking the one that
+        // maximises the uniform scale (largest windows) — same strategy as
+        // computeWindowLayout, but using even grid distribution.
+        var best = null;
+        var bestScale = -1;
+        for (var rowCount = minRows; rowCount <= maxRows; rowCount++) {
+            var gridRows = root.distributeGridRows(entries, rowCount);
+            var low = 0;
+            var high = Math.min(availableWidth, availableHeight);
+            var rowBest = null;
+            var rowBestScale = -1;
+            for (var iteration = 0; iteration < 12; iteration++) {
+                var scale = (low + high) / 2;
+                var composed = root.composeRows(gridRows, scale, availableWidth, availableHeight, gap, padding, footerHeight);
+                if (composed) {
+                    rowBest = composed;
+                    rowBestScale = low;
+                    low = scale;
+                } else {
+                    high = scale;
+                }
+            }
+            if (rowBest && rowBestScale > bestScale) {
+                best = rowBest;
+                bestScale = rowBestScale;
+            }
+        }
+
+        if (!best)
+            best = root.composeRows(root.distributeGridRows(entries, minRows), 1, availableWidth, availableHeight, gap, padding, footerHeight) || [];
+
         for (var resultIndex = 0; resultIndex < best.length; resultIndex++) {
             if (!best[resultIndex])
                 continue;
@@ -1733,6 +1837,18 @@ Item {
             root.setMultiMonitorMode(mode);
             return mode;
         }
+        function workspaceScope(mode: string): string {
+            if (mode !== "current" && mode !== "all")
+                return "expected current or all";
+            root.setWorkspaceScope(mode);
+            return mode;
+        }
+        function layoutMode(mode: string): string {
+            if (mode !== "grid" && mode !== "adaptive")
+                return "expected grid or adaptive";
+            root.setLayoutMode(mode);
+            return mode;
+        }
     }
 
     component HotCornerTarget: Item {
@@ -2071,7 +2187,9 @@ Item {
                             var screenRatio = overviewWindow.screen && overviewWindow.screen.height > 0
                                 ? overviewWindow.screen.width / overviewWindow.screen.height
                                 : 0;
-                            return root.computeWindowLayout(overviewWindow.screenToplevels, width, height, Style.space(64), Style.spacing.sm, root.windowFooterHeight, screenRatio);
+                            return root.layoutMode === "grid"
+                                ? root.computeGridLayout(overviewWindow.screenToplevels, width, height, Style.space(64), Style.spacing.sm, root.windowFooterHeight, screenRatio)
+                                : root.computeWindowLayout(overviewWindow.screenToplevels, width, height, Style.space(64), Style.spacing.sm, root.windowFooterHeight, screenRatio);
                         }
 
                         Item {

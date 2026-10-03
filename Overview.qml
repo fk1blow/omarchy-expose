@@ -135,14 +135,24 @@ Item {
     readonly property string multiMonitorMode: root.pluginEntry && root.pluginEntry.multiMonitorMode === "per-monitor"
         ? "per-monitor"
         : "mirrored"
+    // Workspace thumbnail height as a percentage of the screen height.
+    readonly property real workspaceThumbnailFraction: {
+        var raw = root.pluginEntry ? root.pluginEntry.workspaceThumbnailSize : undefined;
+        var value = raw === null || raw === undefined ? NaN : Number(raw);
+        return (isFinite(value) ? Math.max(6, Math.min(35, value)) : 16) / 100;
+    }
     readonly property bool showFooter: !root.pluginEntry || root.pluginEntry.showFooter !== false
     property bool opened: false
     property bool surfaceMounted: false
     property bool hotCornerArmed: true
-    property string filterText: ""
     property string workspaceScope: (root.pluginEntry && root.pluginEntry.workspaceScope === "all") ? "all" : "current"
     readonly property string layoutMode: root.pluginEntry && root.pluginEntry.layoutMode === "grid" ? "grid" : "adaptive"
     property int selectedIndex: 0
+    property var dragTop: null
+    property var dragSource: null
+    property point dragPoint: Qt.point(0, 0)
+    property var dropWorkspace: null
+    readonly property bool dragActive: root.dragTop !== null
     property int hoveredIndex: -1
     property int previewIndex: -1
     property int previewExitIndex: -1
@@ -250,7 +260,6 @@ Item {
         if (!blurRestoreInFlight)
             root.backgroundBlurReleasePhase = 0;
         root.closeSettings();
-        root.filterText = "";
         root.dismissNotifyShell = false;
         if (root.surfaceMounted) {
             if (blurRestoreInFlight) {
@@ -868,14 +877,6 @@ Item {
         return root.handleSettingsNavigation(event);
     }
 
-    function setFilter(value) {
-        root.filterText = value;
-        root.selectedIndex = 0;
-        root.hoveredIndex = -1;
-        root.clearPreview();
-        root.modelRevision++;
-    }
-
     function setWorkspaceScope(value) {
         var next = value === "current" ? "current" : "all";
         if (next === root.workspaceScope)
@@ -955,12 +956,8 @@ Item {
         if (!root.surfaceMounted && !root.openingPending)
             return;
         var membershipChanged = root.syncSessionToplevels();
-        var filteredMembershipMayChange = !membershipChanged && root.filterText.length > 0;
-        if ((membershipChanged || filteredMembershipMayChange)
-                && (root.previewIndex >= 0 || root.previewExitIndex >= 0))
+        if (membershipChanged && (root.previewIndex >= 0 || root.previewExitIndex >= 0))
             root.clearPreview();
-        if (filteredMembershipMayChange)
-            root.modelRevision++;
         if (root.selectedIndex >= root.filteredToplevels.length)
             root.selectedIndex = Math.max(0, root.filteredToplevels.length - 1);
         if (root.previewIndex >= root.filteredToplevels.length)
@@ -1082,6 +1079,84 @@ Item {
             : "All workspaces";
     }
 
+    function workspacesForScreen(screenName) {
+        var revision = root.modelRevision;
+        var all = Hyprland.workspaces ? Hyprland.workspaces.values : [];
+        var perMonitor = root.multiMonitorMode === "per-monitor";
+        var result = [];
+        for (var index = 0; index < all.length; index++) {
+            var workspace = all[index];
+            if (!workspace || Number(workspace.id) <= 0)
+                continue;
+            if (perMonitor && !(workspace.monitor && String(workspace.monitor.name || "") === String(screenName || "")))
+                continue;
+            result.push(workspace);
+        }
+        result.sort(function (a, b) { return Number(a.id) - Number(b.id); });
+        return result;
+    }
+
+    function isSameWorkspace(left, right) {
+        return Boolean(left) && Boolean(right) && (left === right || Number(left.id) === Number(right.id));
+    }
+
+    function toplevelsOnWorkspace(screenName, workspace) {
+        var candidates = root.toplevelsOnScreen(screenName);
+        var result = [];
+        for (var index = 0; index < candidates.length; index++)
+            if (root.isOnWorkspace(candidates[index], workspace))
+                result.push(candidates[index]);
+        return result;
+    }
+
+    function dispatchLua(expression) {
+        Quickshell.execDetached(["hyprctl", "dispatch", expression]);
+    }
+
+    function goToWorkspace(workspace) {
+        if (!workspace)
+            return;
+        if (!root.isSameWorkspace(workspace, root.workspaceForScreen(root.keyboardScreenName)))
+            Quickshell.execDetached([root.pluginDir + "/focus-workspace", String(workspace.id)]);
+        root.dismiss();
+    }
+
+    // Window drag: a card or a strip miniature can be dropped on a workspace
+    // thumbnail. Points are in overlay window coordinates.
+    function beginWindowDrag(top, source, point) {
+        root.clearPreview();
+        root.dropWorkspace = null;
+        root.dragSource = source;
+        root.dragPoint = point;
+        root.dragTop = top;
+    }
+
+    function updateWindowDrag(point) {
+        root.dragPoint = point;
+    }
+
+    function endWindowDrag() {
+        var top = root.dragTop;
+        var target = root.dropWorkspace;
+        root.dragTop = null;
+        root.dragSource = null;
+        root.dropWorkspace = null;
+        if (!top || !target || root.isOnWorkspace(top, target))
+            return;
+        var address = WindowModel.addressFor(top);
+        if (!address)
+            return;
+        root.dispatchLua("hl.dsp.window.move({ workspace = \"" + target.id + "\", follow = false, window = \"address:" + address + "\" })");
+        windowMoveRefresh.restart();
+    }
+
+    function showWorkspaceNumber(number) {
+        var workspaces = root.workspacesForScreen(root.keyboardScreenName);
+        for (var index = 0; index < workspaces.length; index++)
+            if (Number(workspaces[index].id) === number)
+                return root.goToWorkspace(workspaces[index]);
+    }
+
     function isOnScreen(top, screenName) {
         return WindowModel.isOnScreen(top, screenName, root.multiMonitorMode === "per-monitor");
     }
@@ -1102,7 +1177,6 @@ Item {
     }
 
     function toplevelsForScreen(screenName) {
-        var needle = root.filterText.toLowerCase();
         var currentWorkspace = root.workspaceForScreen(screenName);
         var candidates = root.toplevelsOnScreen(screenName);
         var result = [];
@@ -1110,9 +1184,7 @@ Item {
             var top = candidates[index];
             if (root.workspaceScope === "current" && !root.isOnWorkspace(top, currentWorkspace))
                 continue;
-            var haystack = WindowModel.searchTextFor(top);
-            if (!needle || haystack.indexOf(needle) !== -1)
-                result.push(top);
+            result.push(top);
         }
         return result;
     }
@@ -1530,6 +1602,11 @@ Item {
             if (!event.isAutoRepeat)
                 root.toggleWorkspaceScope();
         }
+        else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_9
+                && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
+            if (!event.isAutoRepeat)
+                root.showWorkspaceNumber(event.key - Qt.Key_0);
+        }
         else if (event.key === Qt.Key_Left)
             root.moveDirectional(-1, 0, layout, Boolean(event.modifiers & Qt.ShiftModifier));
         else if (event.key === Qt.Key_Right)
@@ -1546,10 +1623,6 @@ Item {
             if (!event.isAutoRepeat)
                 root.requestClose(root.filteredToplevels[root.selectedIndex]);
         }
-        else if (Util.editsFilter(event, root.filterText))
-            root.setFilter(Util.editedFilter(event, root.filterText));
-        else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && !(event.modifiers & (Qt.AltModifier | Qt.MetaModifier)))
-            root.setFilter(root.filterText + event.text);
         else
             return;
         event.accepted = true;
@@ -1730,6 +1803,14 @@ Item {
     function expectedOneOf(options) {
         var head = options.slice(0, -1).join(", ");
         return "expected " + head + (options.length > 2 ? ", or " : " or ") + options[options.length - 1];
+    }
+
+    // Window geometry in lastIpcObject only updates on a refresh, so the strip
+    // would draw a moved window at its old spot without one.
+    Timer {
+        id: windowMoveRefresh
+        interval: 120
+        onTriggered: Hyprland.refreshToplevels()
     }
 
     IpcHandler {
@@ -2098,84 +2179,13 @@ Item {
                     anchors.margins: Style.spacing.sm
                     spacing: Style.spacing.md
 
-                    Rectangle {
-                        id: searchBar
-                        Layout.alignment: Qt.AlignHCenter
-                        Layout.preferredWidth: Math.min(Style.space(760), overviewWindow.width - Style.space(48))
-                        Layout.preferredHeight: Style.space(48)
-                        radius: Style.cornerRadius
-                        color: Color.menu.background
-                        border.color: root.filterText ? Color.menu.selectedText : Color.menu.border
-                        border.width: Math.max(1, Style.normalBorderWidth)
-
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: Style.spacing.xl
-                            anchors.rightMargin: Style.spacing.xl
-                            spacing: Style.spacing.md
-                            Text {
-                                text: "⌕"
-                                textFormat: Text.PlainText
-                                color: Color.menu.text
-                                font.family: Style.font.menuFamily
-                                font.pixelSize: Style.font.heading
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: root.filterText || "Type to filter windows…"
-                                textFormat: Text.PlainText
-                                color: Color.menu.text
-                                opacity: root.filterText ? 1 : 0.6
-                                font.family: Style.font.menuFamily
-                                font.pixelSize: Style.font.heading
-                                elide: Text.ElideRight
-                            }
-                            Text {
-                                text: overviewWindow.screenToplevels.length + " windows"
-                                textFormat: Text.PlainText
-                                color: Color.menu.text
-                                opacity: 0.55
-                                font.family: Style.font.menuFamily
-                                font.pixelSize: Style.font.bodySmall
-                            }
-
-                            Rectangle {
-                                Layout.preferredWidth: Math.max(1, Style.normalBorderWidth)
-                                Layout.preferredHeight: Style.space(24)
-                                color: Color.menu.border
-                            }
-
-                            Text {
-                                Layout.maximumWidth: Style.space(176)
-                                text: searchBar.width < Style.space(640)
-                                    ? (root.workspaceScope === "all" ? "All" : "WS " + overviewWindow.screenWorkspaceLabel)
-                                    : overviewWindow.screenScopeLabel
-                                textFormat: Text.PlainText
-                                color: Color.accent
-                                font.family: Style.font.menuFamily
-                                font.pixelSize: Style.font.bodySmall
-                                font.bold: true
-                                elide: Text.ElideRight
-                            }
-
-                            Rectangle {
-                                Layout.preferredWidth: Style.space(34)
-                                Layout.preferredHeight: Style.space(24)
-                                radius: Math.max(2, Style.cornerRadius - Style.spacing.sm)
-                                color: "transparent"
-                                border.color: Color.menu.border
-                                border.width: Math.max(1, Style.normalBorderWidth)
-
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "Tab"
-                                    textFormat: Text.PlainText
-                                    color: Color.menu.text
-                                    font.family: Style.font.menuFamily
-                                    font.pixelSize: Style.font.caption
-                                }
-                            }
-                        }
+                    WorkspaceStrip {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: implicitHeight
+                        Layout.topMargin: Style.spacing.md
+                        controller: root
+                        screen: overviewWindow.modelData
+                        screenName: String(overviewWindow.modelData.name || "")
                     }
 
                     Item {
@@ -2221,11 +2231,9 @@ Item {
                         Text {
                             anchors.centerIn: parent
                             visible: overviewWindow.screenToplevels.length === 0
-                            text: root.filterText
-                                ? "No matching windows"
-                                : (root.workspaceScope === "current"
-                                    ? "No windows on Workspace " + overviewWindow.screenWorkspaceLabel
-                                    : "No open windows")
+                            text: root.workspaceScope === "current"
+                                ? "No windows on Workspace " + overviewWindow.screenWorkspaceLabel
+                                : "No open windows"
                             textFormat: Text.PlainText
                             color: Color.menu.text
                             opacity: 0.7
@@ -2240,7 +2248,7 @@ Item {
                         visible: root.showFooter
 
                         Text {
-                            text: "← ↑ ↓ → navigate   Space preview   Tab / right-click scope   Shift+Q close   Enter open   Esc close"
+                            text: "← ↑ ↓ → navigate   1–9 / click workspace   drag to move   Space preview   Tab / right-click scope   Shift+Q close   Enter open   Esc close"
                             textFormat: Text.PlainText
                             color: Color.menu.text
                             opacity: 0.55
@@ -2287,6 +2295,29 @@ Item {
                             hostWindow: overviewWindow
                         }
                     }
+                }
+            }
+
+            Item {
+                id: dragGhost
+
+                readonly property real sourceWidth: root.dragSource ? Math.max(1, root.dragSource.width) : 1
+                readonly property real sourceHeight: root.dragSource ? Math.max(1, root.dragSource.height) : 1
+                readonly property real ghostScale: Math.max(Style.space(220) / sourceWidth, Math.min(1, Style.space(420) / sourceWidth))
+
+                visible: root.dragActive && root.dragSource !== null
+                z: 150
+                width: sourceWidth * ghostScale
+                height: sourceHeight * ghostScale
+                x: root.dragPoint.x - width / 2
+                y: root.dragPoint.y - height / 2
+                opacity: 0.88
+
+                ShaderEffectSource {
+                    anchors.fill: parent
+                    sourceItem: dragGhost.visible ? root.dragSource : null
+                    live: true
+                    smooth: true
                 }
             }
 

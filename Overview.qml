@@ -16,13 +16,36 @@ Item {
     readonly property string pluginId: String((root.manifest && root.manifest.id) || "expose.window-overview")
     readonly property string pluginDir: String((root.manifest && root.manifest.__sourceDir)
         || (Quickshell.env("HOME") + "/.config/omarchy/plugins/" + root.pluginId))
-    readonly property var pluginEntry: {
-        var config = root.shell && root.shell.shellConfig ? root.shell.shellConfig : null;
+    // Since Omarchy 4.0.4 the shell API handed to plugins no longer carries
+    // shellConfig, so the entry is read from shell.json directly. Until that
+    // read succeeds nothing may be written back: updatePluginSetting rebuilds
+    // the whole entry from this one, and a null here once wiped every key.
+    property var pluginEntry: null
+    property bool pluginEntryLoaded: false
+
+    function loadPluginEntry(text) {
+        var config;
+        try {
+            config = JSON.parse(text || "{}");
+        } catch (error) {
+            console.warn("expose: could not parse shell.json: " + error);
+            return;
+        }
         var plugins = config && Array.isArray(config.plugins) ? config.plugins : [];
+        var entry = null;
         for (var i = 0; i < plugins.length; i++)
             if (plugins[i] && String(plugins[i].id || "") === root.pluginId)
-                return plugins[i];
-        return null;
+                entry = plugins[i];
+        root.pluginEntry = entry;
+        root.pluginEntryLoaded = true;
+    }
+
+    FileView {
+        path: Quickshell.env("HOME") + "/.config/omarchy/shell.json"
+        watchChanges: true
+        printErrors: false
+        onLoaded: root.loadPluginEntry(text())
+        onFileChanged: reload()
     }
     readonly property string previewPlacement: root.pluginEntry && root.pluginEntry.previewPlacement === "centered" ? "centered" : "in-place"
     readonly property var windowFooterStyles: ["floating", "integrated", "overlay", "centered"]
@@ -434,7 +457,7 @@ Item {
     }
 
     function updatePluginSetting(name, value) {
-        if (!root.shell || typeof root.shell.updateEntryInline !== "function")
+        if (!root.pluginEntryLoaded || !root.shell || typeof root.shell.updateEntryInline !== "function")
             return;
         var settings = {};
         var current = root.pluginEntry || {};

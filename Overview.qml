@@ -16,13 +16,36 @@ Item {
     readonly property string pluginId: String((root.manifest && root.manifest.id) || "expose.window-overview")
     readonly property string pluginDir: String((root.manifest && root.manifest.__sourceDir)
         || (Quickshell.env("HOME") + "/.config/omarchy/plugins/" + root.pluginId))
-    readonly property var pluginEntry: {
-        var config = root.shell && root.shell.shellConfig ? root.shell.shellConfig : null;
+    // Since Omarchy 4.0.4 the shell API handed to plugins no longer carries
+    // shellConfig, so the entry is read from shell.json directly. Until that
+    // read succeeds nothing may be written back: updatePluginSetting rebuilds
+    // the whole entry from this one, and a null here once wiped every key.
+    property var pluginEntry: null
+    property bool pluginEntryLoaded: false
+
+    function loadPluginEntry(text) {
+        var config;
+        try {
+            config = JSON.parse(text || "{}");
+        } catch (error) {
+            console.warn("expose: could not parse shell.json: " + error);
+            return;
+        }
         var plugins = config && Array.isArray(config.plugins) ? config.plugins : [];
+        var entry = null;
         for (var i = 0; i < plugins.length; i++)
             if (plugins[i] && String(plugins[i].id || "") === root.pluginId)
-                return plugins[i];
-        return null;
+                entry = plugins[i];
+        root.pluginEntry = entry;
+        root.pluginEntryLoaded = true;
+    }
+
+    FileView {
+        path: Quickshell.env("HOME") + "/.config/omarchy/shell.json"
+        watchChanges: true
+        printErrors: false
+        onLoaded: root.loadPluginEntry(text())
+        onFileChanged: reload()
     }
     readonly property string previewPlacement: root.pluginEntry && root.pluginEntry.previewPlacement === "centered" ? "centered" : "in-place"
     readonly property var windowFooterStyles: ["floating", "integrated", "overlay", "centered"]
@@ -113,6 +136,13 @@ Item {
         return isFinite(value) ? Math.max(0, Math.min(90, Math.round(value))) : 6;
     }
     readonly property bool hotCornerEnabled: !root.pluginEntry || root.pluginEntry.hotCornerEnabled !== false
+    // Local patch: the hot corner sits exactly where a full-screen game wants
+    // the cursor, so a flick to the edge yanked the overview over the game.
+    // Rather than turning the corner off by hand before every session, scan for
+    // a running game and take the corner out of the way while one is up. Only
+    // the corner is gated: an explicit keybind or IPC call still opens the
+    // overview on purpose, and the corner still closes one that is open.
+    property bool gameSessionActive: false
     readonly property var hotCornerPositions: ["top-left", "top-right", "bottom-left", "bottom-right"]
     readonly property string hotCornerPosition: {
         var position = String((root.pluginEntry && root.pluginEntry.hotCornerPosition) || "top-left");
@@ -128,13 +158,24 @@ Item {
     readonly property string multiMonitorMode: root.pluginEntry && root.pluginEntry.multiMonitorMode === "per-monitor"
         ? "per-monitor"
         : "mirrored"
+    // Workspace thumbnail height as a percentage of the screen height.
+    readonly property real workspaceThumbnailFraction: {
+        var raw = root.pluginEntry ? root.pluginEntry.workspaceThumbnailSize : undefined;
+        var value = raw === null || raw === undefined ? NaN : Number(raw);
+        return (isFinite(value) ? Math.max(6, Math.min(35, value)) : 16) / 100;
+    }
     readonly property bool showFooter: !root.pluginEntry || root.pluginEntry.showFooter !== false
     property bool opened: false
     property bool surfaceMounted: false
     property bool hotCornerArmed: true
-    property string filterText: ""
-    property string workspaceScope: "all"
+    property string workspaceScope: (root.pluginEntry && root.pluginEntry.workspaceScope === "all") ? "all" : "current"
+    readonly property string layoutMode: root.pluginEntry && root.pluginEntry.layoutMode === "grid" ? "grid" : "adaptive"
     property int selectedIndex: 0
+    property var dragTop: null
+    property var dragSource: null
+    property point dragPoint: Qt.point(0, 0)
+    property var dropWorkspace: null
+    readonly property bool dragActive: root.dragTop !== null
     property int hoveredIndex: -1
     property int previewIndex: -1
     property int previewExitIndex: -1
@@ -242,8 +283,6 @@ Item {
         if (!blurRestoreInFlight)
             root.backgroundBlurReleasePhase = 0;
         root.closeSettings();
-        root.filterText = "";
-        root.workspaceScope = "all";
         root.dismissNotifyShell = false;
         if (root.surfaceMounted) {
             if (blurRestoreInFlight) {
@@ -418,7 +457,7 @@ Item {
     }
 
     function updatePluginSetting(name, value) {
-        if (!root.shell || typeof root.shell.updateEntryInline !== "function")
+        if (!root.pluginEntryLoaded || !root.shell || typeof root.shell.updateEntryInline !== "function")
             return;
         var settings = {};
         var current = root.pluginEntry || {};
@@ -650,6 +689,12 @@ Item {
             root.updatePluginSetting("multiMonitorMode", mode);
     }
 
+    function setLayoutMode(value) {
+        var mode = value === "grid" ? "grid" : "adaptive";
+        if (mode !== root.layoutMode)
+            root.updatePluginSetting("layoutMode", mode);
+    }
+
     function requestFooterHide() {
         if (!root.showFooter)
             return;
@@ -680,14 +725,85 @@ Item {
         return false;
     }
 
+    // Detection is self-contained. Reading it off another plugin's service
+    // worked, but a corner that only behaves while a second, unrelated plugin
+    // happens to be installed is a dependency this one should not carry - and
+    // that plugin is the more ephemeral of the two.
+    //
+    // Polled only while the corner is enabled: with the corner off there is
+    // nothing to gate, so nothing runs.
+    Timer {
+        interval: 5000
+        running: root.hotCornerEnabled
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: if (!gameDetectProcess.running) gameDetectProcess.running = true
+    }
+
+    // A game that stops reporting for a single poll is almost always a loading
+    // screen or a process the scan briefly missed, not a session that ended.
+    // Remapping the corner underneath a running game is the whole failure this
+    // patch exists to prevent, so ending waits out a grace period that starting
+    // deliberately does not.
+    Timer {
+        id: gameEndGrace
+        interval: 15000
+        repeat: false
+        onTriggered: root.gameSessionActive = false
+    }
+
+    Process {
+        id: gameDetectProcess
+        property bool warned: false
+        command: ["bash", root.pluginDir + "/game-detect.sh"]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var answer = String(text).trim();
+                var usable = answer === "0" || answer === "1";
+                if (!usable) {
+                    // Anything else means the scan did not run - script missing
+                    // or no shell to run it. It is silent, so say it once: the
+                    // visible symptom is the corner arming mid-game with
+                    // nothing to explain it.
+                    if (!gameDetectProcess.warned) {
+                        gameDetectProcess.warned = true;
+                        console.warn("expose: game-detect.sh produced no usable answer"
+                            + "; the hot corner will not be gated during games");
+                    }
+                }
+                // "I cannot tell" and "no game" release the corner alike. An
+                // unreadable scan must not cost anyone the hot corner, and
+                // returning early here instead would only fail open from a cold
+                // start: break the scan while a session is up and the corner
+                // would stay unmapped for the rest of the shell's life, long
+                // after the game exits.
+                if (answer === "1") {
+                    gameEndGrace.stop();
+                    root.gameSessionActive = true;
+                } else if (root.gameSessionActive && !gameEndGrace.running) {
+                    gameEndGrace.restart();
+                }
+            }
+        }
+    }
+
     function triggerHotCorner(screenName) {
         if (!root.hotCornerEnabled || !root.hotCornerArmed)
             return;
-        root.hotCornerArmed = false;
+        // Closing stays available even mid-game: the overview can only be open
+        // here because a keybind or IPC call opened it deliberately, and the
+        // corner is its documented toggle.
         if (root.opened || root.openingPending) {
+            root.hotCornerArmed = false;
             root.dismiss();
             return;
         }
+        // Leaves the corner armed, so it is live the moment the game ends
+        // rather than waiting on an exit that unmapped surfaces cannot deliver.
+        if (root.gameSessionActive)
+            return;
+        root.hotCornerArmed = false;
         var name = String(screenName || "");
         if (name) {
             root.overviewScreenPinned = true;
@@ -707,6 +823,17 @@ Item {
 
     onHotCornerEnabledChanged: {
         if (!root.hotCornerEnabled) {
+            hotCornerRearm.stop();
+            root.hotCornerArmed = true;
+        }
+    }
+
+    // Same reset as disabling the corner, and for the same reason: the surfaces
+    // that deliver the exit event which re-arms the corner are gone while a game
+    // is up. Trigger the corner, have a game start before the exit lands, and
+    // the flag would still be false when the corner comes back.
+    onGameSessionActiveChanged: {
+        if (!root.gameSessionActive) {
             hotCornerRearm.stop();
             root.hotCornerArmed = true;
         }
@@ -773,19 +900,12 @@ Item {
         return root.handleSettingsNavigation(event);
     }
 
-    function setFilter(value) {
-        root.filterText = value;
-        root.selectedIndex = 0;
-        root.hoveredIndex = -1;
-        root.clearPreview();
-        root.modelRevision++;
-    }
-
     function setWorkspaceScope(value) {
         var next = value === "current" ? "current" : "all";
-        if (next === "current" && !root.workspaceForScreen(root.keyboardScreenName))
-            return;
         if (next === root.workspaceScope)
+            return;
+        root.updatePluginSetting("workspaceScope", next);
+        if (next === "current" && !root.workspaceForScreen(root.keyboardScreenName))
             return;
         root.workspaceScope = next;
         root.hoveredIndex = -1;
@@ -859,12 +979,8 @@ Item {
         if (!root.surfaceMounted && !root.openingPending)
             return;
         var membershipChanged = root.syncSessionToplevels();
-        var filteredMembershipMayChange = !membershipChanged && root.filterText.length > 0;
-        if ((membershipChanged || filteredMembershipMayChange)
-                && (root.previewIndex >= 0 || root.previewExitIndex >= 0))
+        if (membershipChanged && (root.previewIndex >= 0 || root.previewExitIndex >= 0))
             root.clearPreview();
-        if (filteredMembershipMayChange)
-            root.modelRevision++;
         if (root.selectedIndex >= root.filteredToplevels.length)
             root.selectedIndex = Math.max(0, root.filteredToplevels.length - 1);
         if (root.previewIndex >= root.filteredToplevels.length)
@@ -986,6 +1102,133 @@ Item {
             : "All workspaces";
     }
 
+    // The workspaces marked persistent in the Hyprland config, as
+    // [{ id, monitor }]. Quickshell's workspace list cannot be trusted for
+    // these: it only learns of a workspace from its startup snapshot or an
+    // event, and an empty persistent one that has never been visited is in
+    // neither - so the strip showed only the workspaces used since login.
+    property var persistentWorkspaces: []
+
+    function loadPersistentWorkspaces(text) {
+        var rules;
+        try {
+            rules = JSON.parse(text || "[]");
+        } catch (error) {
+            console.warn("expose: could not parse hyprctl workspacerules: " + error);
+            return;
+        }
+        var result = [];
+        for (var index = 0; index < (Array.isArray(rules) ? rules.length : 0); index++) {
+            var rule = rules[index];
+            var name = String(rule && rule.workspaceString || "");
+            if (!rule || rule.persistent !== true || !/^[1-9][0-9]*$/.test(name))
+                continue;
+            result.push({ id: Number(name), monitor: String(rule.monitor || "") });
+        }
+        root.persistentWorkspaces = result;
+    }
+
+    Process {
+        id: workspaceRulesProcess
+        command: ["hyprctl", "-j", "workspacerules"]
+        running: true
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: root.loadPersistentWorkspaces(text)
+        }
+    }
+
+    function workspacesForScreen(screenName) {
+        var revision = root.modelRevision;
+        var all = Hyprland.workspaces ? Hyprland.workspaces.values : [];
+        var perMonitor = root.multiMonitorMode === "per-monitor";
+        var result = [];
+        var seen = {};
+        for (var index = 0; index < all.length; index++) {
+            var workspace = all[index];
+            if (!workspace || Number(workspace.id) <= 0)
+                continue;
+            if (perMonitor && !(workspace.monitor && String(workspace.monitor.name || "") === String(screenName || "")))
+                continue;
+            seen[Number(workspace.id)] = true;
+            result.push(workspace);
+        }
+        // Stand-ins carry only id and name, which is all the strip, a click,
+        // a drop or a number key reads.
+        for (var rule = 0; rule < root.persistentWorkspaces.length; rule++) {
+            var persistent = root.persistentWorkspaces[rule];
+            if (seen[persistent.id])
+                continue;
+            if (perMonitor && persistent.monitor !== "" && persistent.monitor !== String(screenName || ""))
+                continue;
+            seen[persistent.id] = true;
+            result.push({ id: persistent.id, name: String(persistent.id) });
+        }
+        result.sort(function (a, b) { return Number(a.id) - Number(b.id); });
+        return result;
+    }
+
+    function isSameWorkspace(left, right) {
+        return Boolean(left) && Boolean(right) && (left === right || Number(left.id) === Number(right.id));
+    }
+
+    function toplevelsOnWorkspace(screenName, workspace) {
+        var candidates = root.toplevelsOnScreen(screenName);
+        var result = [];
+        for (var index = 0; index < candidates.length; index++)
+            if (root.isOnWorkspace(candidates[index], workspace))
+                result.push(candidates[index]);
+        return result;
+    }
+
+    function dispatchLua(expression) {
+        Quickshell.execDetached(["hyprctl", "dispatch", expression]);
+    }
+
+    function goToWorkspace(workspace) {
+        if (!workspace)
+            return;
+        if (!root.isSameWorkspace(workspace, root.workspaceForScreen(root.keyboardScreenName)))
+            Quickshell.execDetached([root.pluginDir + "/focus-workspace", String(workspace.id)]);
+        root.dismiss();
+    }
+
+    // Window drag: a card or a strip miniature can be dropped on a workspace
+    // thumbnail. Points are in overlay window coordinates.
+    function beginWindowDrag(top, source, point) {
+        root.clearPreview();
+        root.dropWorkspace = null;
+        root.dragSource = source;
+        root.dragPoint = point;
+        root.dragTop = top;
+    }
+
+    function updateWindowDrag(point) {
+        root.dragPoint = point;
+    }
+
+    function endWindowDrag() {
+        var top = root.dragTop;
+        var target = root.dropWorkspace;
+        root.dragTop = null;
+        root.dragSource = null;
+        root.dropWorkspace = null;
+        if (!top || !target || root.isOnWorkspace(top, target))
+            return;
+        var address = WindowModel.addressFor(top);
+        if (!address)
+            return;
+        root.dispatchLua("hl.dsp.window.move({ workspace = \"" + target.id + "\", follow = false, window = \"address:" + address + "\" })");
+        windowMoveRefresh.restart();
+    }
+
+    function showWorkspaceNumber(number) {
+        var workspaces = root.workspacesForScreen(root.keyboardScreenName);
+        for (var index = 0; index < workspaces.length; index++)
+            if (Number(workspaces[index].id) === number)
+                return root.goToWorkspace(workspaces[index]);
+    }
+
     function isOnScreen(top, screenName) {
         return WindowModel.isOnScreen(top, screenName, root.multiMonitorMode === "per-monitor");
     }
@@ -1006,7 +1249,6 @@ Item {
     }
 
     function toplevelsForScreen(screenName) {
-        var needle = root.filterText.toLowerCase();
         var currentWorkspace = root.workspaceForScreen(screenName);
         var candidates = root.toplevelsOnScreen(screenName);
         var result = [];
@@ -1014,9 +1256,7 @@ Item {
             var top = candidates[index];
             if (root.workspaceScope === "current" && !root.isOnWorkspace(top, currentWorkspace))
                 continue;
-            var haystack = WindowModel.searchTextFor(top);
-            if (!needle || haystack.indexOf(needle) !== -1)
-                result.push(top);
+            result.push(top);
         }
         return result;
     }
@@ -1211,6 +1451,103 @@ Item {
         return best;
     }
 
+    function distributeGridRows(entries, rowCount) {
+        var rows = [];
+        for (var rowIndex = 0; rowIndex < rowCount; rowIndex++)
+            rows.push({ entries: [], naturalWidth: 0 });
+        var perRow = Math.ceil(entries.length / rowCount);
+        for (var entryIndex = 0; entryIndex < entries.length; entryIndex++) {
+            var row = Math.min(Math.floor(entryIndex / perRow), rowCount - 1);
+            rows[row].entries.push(entries[entryIndex]);
+            rows[row].naturalWidth += Math.sqrt(entries[entryIndex].weight * entries[entryIndex].ratio);
+        }
+        for (var sortRow = 0; sortRow < rows.length; sortRow++)
+            rows[sortRow].entries.sort(function (a, b) { return a.index - b.index; });
+        return rows;
+    }
+
+    function computeGridLayout(toplevels, width, height, gap, padding, footerHeight, viewportRatioHint) {
+        var count = toplevels.length;
+        if (!count || width <= 0 || height <= 0)
+            return [];
+
+        var edgeInset = gap / 2;
+        var availableWidth = Math.max(1, width - edgeInset * 2);
+        var availableHeight = Math.max(1, height - edgeInset * 2);
+
+        var entries = [];
+        for (var index = 0; index < count; index++) {
+            var ratio = root.aspectRatioFor(toplevels[index]);
+            entries.push({
+                index: index,
+                ratio: ratio,
+                weight: Math.max(0.72, Math.min(1.28, Math.sqrt(ratio / 1.6))),
+                extremity: Math.max(ratio, 1 / ratio)
+            });
+        }
+        entries.sort(function (a, b) {
+            if (a.extremity !== b.extremity)
+                return b.extremity - a.extremity;
+            return a.index - b.index;
+        });
+
+        // macOS Exposé-style grid (US Patent 8,612,883):
+        //   columns = round(sqrt(count * viewportRatio)), rows = ceil(count / columns)
+        var viewportRatio = Number(viewportRatioHint);
+        if (!isFinite(viewportRatio) || viewportRatio <= 0)
+            viewportRatio = availableWidth / availableHeight;
+
+        var sqrtCols = Math.max(1, Math.round(Math.sqrt(count * viewportRatio)));
+        var estimatedRows = Math.ceil(count / sqrtCols);
+
+        // Row limits: at least 2 rows for 4+ windows (grid preference), at most what fits
+        var footerSpacing = footerHeight > 0 ? padding : 0;
+        var minimumCardHeight = footerHeight + padding * 2 + footerSpacing + 1;
+        var maxRows = Math.max(1, Math.min(count, Math.floor((availableHeight + gap) / (minimumCardHeight + gap))));
+        var minRows = Math.max(1, Math.min(maxRows, estimatedRows));
+        if (count >= 4 && minRows === 1)
+            minRows = 2;
+
+        // Try each row count from minRows to maxRows, picking the one that
+        // maximises the uniform scale (largest windows) — same strategy as
+        // computeWindowLayout, but using even grid distribution.
+        var best = null;
+        var bestScale = -1;
+        for (var rowCount = minRows; rowCount <= maxRows; rowCount++) {
+            var gridRows = root.distributeGridRows(entries, rowCount);
+            var low = 0;
+            var high = Math.min(availableWidth, availableHeight);
+            var rowBest = null;
+            var rowBestScale = -1;
+            for (var iteration = 0; iteration < 12; iteration++) {
+                var scale = (low + high) / 2;
+                var composed = root.composeRows(gridRows, scale, availableWidth, availableHeight, gap, padding, footerHeight);
+                if (composed) {
+                    rowBest = composed;
+                    rowBestScale = low;
+                    low = scale;
+                } else {
+                    high = scale;
+                }
+            }
+            if (rowBest && rowBestScale > bestScale) {
+                best = rowBest;
+                bestScale = rowBestScale;
+            }
+        }
+
+        if (!best)
+            best = root.composeRows(root.distributeGridRows(entries, minRows), 1, availableWidth, availableHeight, gap, padding, footerHeight) || [];
+
+        for (var resultIndex = 0; resultIndex < best.length; resultIndex++) {
+            if (!best[resultIndex])
+                continue;
+            best[resultIndex].x += edgeInset;
+            best[resultIndex].y += edgeInset;
+        }
+        return best;
+    }
+
     function previewRectFor(top, sourceRect, width, height, padding, footerHeight) {
         var ratio = root.aspectRatioFor(top);
         var maxWidth = width * 0.84;
@@ -1337,6 +1674,11 @@ Item {
             if (!event.isAutoRepeat)
                 root.toggleWorkspaceScope();
         }
+        else if (event.key >= Qt.Key_1 && event.key <= Qt.Key_9
+                && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
+            if (!event.isAutoRepeat)
+                root.showWorkspaceNumber(event.key - Qt.Key_0);
+        }
         else if (event.key === Qt.Key_Left)
             root.moveDirectional(-1, 0, layout, Boolean(event.modifiers & Qt.ShiftModifier));
         else if (event.key === Qt.Key_Right)
@@ -1353,10 +1695,6 @@ Item {
             if (!event.isAutoRepeat)
                 root.requestClose(root.filteredToplevels[root.selectedIndex]);
         }
-        else if (Util.editsFilter(event, root.filterText))
-            root.setFilter(Util.editedFilter(event, root.filterText));
-        else if (event.text && event.text.length === 1 && event.text.charCodeAt(0) >= 32 && !(event.modifiers & (Qt.AltModifier | Qt.MetaModifier)))
-            root.setFilter(root.filterText + event.text);
         else
             return;
         event.accepted = true;
@@ -1528,6 +1866,8 @@ Item {
                 root.selectedIndex = index;
         }
         function onRawEvent(event) {
+            if (event && event.name === "configreloaded")
+                workspaceRulesProcess.running = true;
             if (event && event.name === "custom" && event.data === "expose.window-overview:toggle")
                 root.toggle();
         }
@@ -1537,6 +1877,14 @@ Item {
     function expectedOneOf(options) {
         var head = options.slice(0, -1).join(", ");
         return "expected " + head + (options.length > 2 ? ", or " : " or ") + options[options.length - 1];
+    }
+
+    // Window geometry in lastIpcObject only updates on a refresh, so the strip
+    // would draw a moved window at its old spot without one.
+    Timer {
+        id: windowMoveRefresh
+        interval: 120
+        onTriggered: Hyprland.refreshToplevels()
     }
 
     IpcHandler {
@@ -1644,6 +1992,18 @@ Item {
             root.setMultiMonitorMode(mode);
             return mode;
         }
+        function workspaceScope(mode: string): string {
+            if (mode !== "current" && mode !== "all")
+                return "expected current or all";
+            root.setWorkspaceScope(mode);
+            return mode;
+        }
+        function layoutMode(mode: string): string {
+            if (mode !== "grid" && mode !== "adaptive")
+                return "expected grid or adaptive";
+            root.setLayoutMode(mode);
+            return mode;
+        }
     }
 
     component HotCornerTarget: Item {
@@ -1688,7 +2048,11 @@ Item {
     // other displays remain disabled until the overview unmounts.
     Variants {
         id: hotCornerInstances
-        model: root.hotCornerEnabled ? Quickshell.screens : []
+        // Gated on the game session too, not just the trigger: this window
+        // carries an input region over the corner strip, so leaving it mapped
+        // would still pull pointer focus off a full-screen game and swallow
+        // clicks that land in the strip.
+        model: root.hotCornerEnabled && !root.gameSessionActive ? Quickshell.screens : []
 
         PanelWindow { // qmllint disable uncreatable-type
             required property var modelData
@@ -1871,7 +2235,12 @@ Item {
 
                 MouseArea {
                     anchors.fill: parent
-                    onClicked: {
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    onClicked: function (mouse) {
+                        if (mouse.button === Qt.RightButton) {
+                            root.toggleWorkspaceScope();
+                            return;
+                        }
                         if (root.previewIndex >= 0 || root.previewExitIndex >= 0)
                             root.clearPreview();
                         else
@@ -1884,84 +2253,13 @@ Item {
                     anchors.margins: Style.spacing.sm
                     spacing: Style.spacing.md
 
-                    Rectangle {
-                        id: searchBar
-                        Layout.alignment: Qt.AlignHCenter
-                        Layout.preferredWidth: Math.min(Style.space(760), overviewWindow.width - Style.space(48))
-                        Layout.preferredHeight: Style.space(48)
-                        radius: Style.cornerRadius
-                        color: Color.menu.background
-                        border.color: root.filterText ? Color.menu.selectedText : Color.menu.border
-                        border.width: Math.max(1, Style.normalBorderWidth)
-
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: Style.spacing.xl
-                            anchors.rightMargin: Style.spacing.xl
-                            spacing: Style.spacing.md
-                            Text {
-                                text: "⌕"
-                                textFormat: Text.PlainText
-                                color: Color.menu.text
-                                font.family: Style.font.menuFamily
-                                font.pixelSize: Style.font.heading
-                            }
-                            Text {
-                                Layout.fillWidth: true
-                                text: root.filterText || "Type to filter windows…"
-                                textFormat: Text.PlainText
-                                color: Color.menu.text
-                                opacity: root.filterText ? 1 : 0.6
-                                font.family: Style.font.menuFamily
-                                font.pixelSize: Style.font.heading
-                                elide: Text.ElideRight
-                            }
-                            Text {
-                                text: overviewWindow.screenToplevels.length + " windows"
-                                textFormat: Text.PlainText
-                                color: Color.menu.text
-                                opacity: 0.55
-                                font.family: Style.font.menuFamily
-                                font.pixelSize: Style.font.bodySmall
-                            }
-
-                            Rectangle {
-                                Layout.preferredWidth: Math.max(1, Style.normalBorderWidth)
-                                Layout.preferredHeight: Style.space(24)
-                                color: Color.menu.border
-                            }
-
-                            Text {
-                                Layout.maximumWidth: Style.space(176)
-                                text: searchBar.width < Style.space(640)
-                                    ? (root.workspaceScope === "all" ? "All" : "WS " + overviewWindow.screenWorkspaceLabel)
-                                    : overviewWindow.screenScopeLabel
-                                textFormat: Text.PlainText
-                                color: Color.accent
-                                font.family: Style.font.menuFamily
-                                font.pixelSize: Style.font.bodySmall
-                                font.bold: true
-                                elide: Text.ElideRight
-                            }
-
-                            Rectangle {
-                                Layout.preferredWidth: Style.space(34)
-                                Layout.preferredHeight: Style.space(24)
-                                radius: Math.max(2, Style.cornerRadius - Style.spacing.sm)
-                                color: "transparent"
-                                border.color: Color.menu.border
-                                border.width: Math.max(1, Style.normalBorderWidth)
-
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "Tab"
-                                    textFormat: Text.PlainText
-                                    color: Color.menu.text
-                                    font.family: Style.font.menuFamily
-                                    font.pixelSize: Style.font.caption
-                                }
-                            }
-                        }
+                    WorkspaceStrip {
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: implicitHeight
+                        Layout.topMargin: Style.spacing.md
+                        controller: root
+                        screen: overviewWindow.modelData
+                        screenName: String(overviewWindow.modelData.name || "")
                     }
 
                     Item {
@@ -1973,7 +2271,9 @@ Item {
                             var screenRatio = overviewWindow.screen && overviewWindow.screen.height > 0
                                 ? overviewWindow.screen.width / overviewWindow.screen.height
                                 : 0;
-                            return root.computeWindowLayout(overviewWindow.screenToplevels, width, height, Style.space(64), Style.spacing.sm, root.windowFooterHeight, screenRatio);
+                            return root.layoutMode === "grid"
+                                ? root.computeGridLayout(overviewWindow.screenToplevels, width, height, Style.space(64), Style.spacing.sm, root.windowFooterHeight, screenRatio)
+                                : root.computeWindowLayout(overviewWindow.screenToplevels, width, height, Style.space(64), Style.spacing.sm, root.windowFooterHeight, screenRatio);
                         }
 
                         Item {
@@ -2005,11 +2305,9 @@ Item {
                         Text {
                             anchors.centerIn: parent
                             visible: overviewWindow.screenToplevels.length === 0
-                            text: root.filterText
-                                ? "No matching windows"
-                                : (root.workspaceScope === "current"
-                                    ? "No windows on Workspace " + overviewWindow.screenWorkspaceLabel
-                                    : "No open windows")
+                            text: root.workspaceScope === "current"
+                                ? "No windows on Workspace " + overviewWindow.screenWorkspaceLabel
+                                : "No open windows"
                             textFormat: Text.PlainText
                             color: Color.menu.text
                             opacity: 0.7
@@ -2024,7 +2322,7 @@ Item {
                         visible: root.showFooter
 
                         Text {
-                            text: "← ↑ ↓ → navigate   Space preview   Tab scope   Shift+Q close   Enter open   Esc close"
+                            text: "← ↑ ↓ → navigate   1–9 / click workspace   drag to move   Space preview   Tab / right-click scope   Shift+Q close   Enter open   Esc close"
                             textFormat: Text.PlainText
                             color: Color.menu.text
                             opacity: 0.55
@@ -2071,6 +2369,29 @@ Item {
                             hostWindow: overviewWindow
                         }
                     }
+                }
+            }
+
+            Item {
+                id: dragGhost
+
+                readonly property real sourceWidth: root.dragSource ? Math.max(1, root.dragSource.width) : 1
+                readonly property real sourceHeight: root.dragSource ? Math.max(1, root.dragSource.height) : 1
+                readonly property real ghostScale: Math.max(Style.space(220) / sourceWidth, Math.min(1, Style.space(420) / sourceWidth))
+
+                visible: root.dragActive && root.dragSource !== null
+                z: 150
+                width: sourceWidth * ghostScale
+                height: sourceHeight * ghostScale
+                x: root.dragPoint.x - width / 2
+                y: root.dragPoint.y - height / 2
+                opacity: 0.88
+
+                ShaderEffectSource {
+                    anchors.fill: parent
+                    sourceItem: dragGhost.visible ? root.dragSource : null
+                    live: true
+                    smooth: true
                 }
             }
 

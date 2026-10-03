@@ -1,0 +1,15 @@
+#!/bin/bash
+set -euo pipefail
+
+workspace="${1:-}"
+[[ $workspace =~ ^[0-9]+$ ]] || exit 2
+
+# Same wait as activate-window: when the overlay's exclusive keyboard surface
+# unmaps, Hyprland hands focus back to the window that had it, which pulls the
+# view back to that window's workspace. Switch only once the surface is gone.
+for _ in $(seq 1 60); do
+  hyprctl layers 2>/dev/null | grep -q "expose-window-overview" || break
+  sleep 0.005
+done
+
+hyprctl dispatch "hl.dsp.focus({ workspace = \"$workspace\" })" >/dev/null

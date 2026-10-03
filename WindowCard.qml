@@ -57,11 +57,8 @@ Rectangle {
     width: layoutRect.width
     height: layoutRect.height
     z: previewed ? 11 : (exitingPreview ? 10 : 0)
-    radius: integratedFooter ? Style.cornerRadius : 0
-    color: integratedFooter ? Color.menu.background : "transparent"
-    border.color: integratedFooter ? outlineColor : "transparent"
-    border.width: integratedFooter ? outlineWidth : 0
-    opacity: card.controller.previewIndex < 0 || previewed ? 1 : 0.28
+    color: "transparent"
+    opacity: card.controller.dragTop === card.modelData ? 0.35 : (card.controller.previewIndex < 0 || previewed ? 1 : 0.28)
 
     MouseArea {
         anchors.fill: parent
@@ -88,36 +85,90 @@ Rectangle {
                 card.controller.hoveredIndex = -1;
 
         }
-        acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+        acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
+        property point pressPoint: Qt.point(0, 0)
+        property bool dragging: false
+        onPressed: function(mouse) {
+            pressPoint = Qt.point(mouse.x, mouse.y);
+            dragging = false;
+        }
+        onPositionChanged: function(mouse) {
+            if (!(mouse.buttons & Qt.LeftButton))
+                return;
+            var point = mapToItem(null, mouse.x, mouse.y);
+            if (!dragging && Math.abs(mouse.x - pressPoint.x) + Math.abs(mouse.y - pressPoint.y) > Style.space(8)) {
+                dragging = true;
+                card.controller.beginWindowDrag(card.modelData, frame, point);
+            } else if (dragging) {
+                card.controller.updateWindowDrag(point);
+            }
+        }
+        onReleased: {
+            if (dragging)
+                card.controller.endWindowDrag();
+        }
+        onCanceled: {
+            if (dragging)
+                card.controller.endWindowDrag();
+            dragging = false;
+        }
         onClicked: function(mouse) {
+            if (dragging) {
+                dragging = false;
+                return;
+            }
             if (mouse.button === Qt.MiddleButton)
                 card.controller.requestClose(card.modelData);
+            else if (mouse.button === Qt.RightButton)
+                card.controller.toggleWorkspaceScope();
             else
                 card.controller.activate(card.modelData);
         }
     }
 
-    ColumnLayout {
-        anchors.fill: parent
-        anchors.margins: Style.spacing.sm
-        spacing: card.overlayFooter ? 0 : Style.spacing.sm
+    // One frame hugs the preview and the footer under it: a single outline
+    // around both and a hairline between them, instead of a bordered preview
+    // nested inside a bordered card.
+    Item {
+        id: frame
+
+        readonly property real windowAspectRatio: card.controller.aspectRatioFor(card.modelData)
+        readonly property real footerHeight: card.overlayFooter ? 0 : Style.space(40) + Style.spacing.sm
+        readonly property real availableWidth: Math.max(1, card.width - Style.spacing.sm * 2)
+        readonly property real availablePreviewHeight: Math.max(1, card.height - Style.spacing.sm * 2 - footerHeight)
+        readonly property real previewWidth: Math.min(availableWidth, availablePreviewHeight * windowAspectRatio)
+        readonly property real previewHeight: Math.min(availablePreviewHeight, availableWidth / windowAspectRatio)
+        readonly property real radius: Style.cornerRadius
+        readonly property real separatorWidth: card.outlineWidth
+
+        anchors.centerIn: parent
+        width: previewWidth
+        height: previewHeight + footerHeight
 
         Item {
-            Layout.fillWidth: true
-            Layout.fillHeight: true
+            id: frameContent
+
+            anchors.fill: parent
+            layer.enabled: true
 
             Rectangle {
-                id: previewFrame
+                anchors.fill: parent
+                color: Color.menu.background
+            }
 
-                readonly property real windowAspectRatio: card.controller.aspectRatioFor(card.modelData)
+            Item {
+                id: previewArea
 
-                anchors.centerIn: parent
-                width: Math.min(parent.width, parent.height * windowAspectRatio)
-                height: Math.min(parent.height, parent.width / windowAspectRatio)
-                radius: Math.max(0, Style.cornerRadius - Style.spacing.xs)
-                color: Color.background
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                height: frame.previewHeight
                 clip: true
-                layer.enabled: true
+
+                Rectangle {
+                    anchors.fill: parent
+                    color: Color.background
+                }
 
                 CardText {
                     anchors.centerIn: parent
@@ -149,48 +200,60 @@ Rectangle {
                     sourceComponent: overlayFooter
                 }
 
-                layer.effect: MultiEffect {
-                    maskEnabled: true
-                    maskSource: previewMask
-                    maskThresholdMin: 0.5
-                    maskSpreadAtMin: 1
+            }
+
+            Rectangle {
+                visible: !card.overlayFooter
+                anchors.left: parent.left
+                anchors.right: parent.right
+                y: frame.previewHeight
+                height: frame.separatorWidth
+                color: card.outlineColor
+            }
+
+            Item {
+                visible: !card.overlayFooter
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.bottom: parent.bottom
+                anchors.leftMargin: Style.spacing.sm + card.outlineWidth
+                anchors.rightMargin: Style.spacing.sm + card.outlineWidth
+                height: frame.footerHeight - frame.separatorWidth
+
+                Loader {
+                    anchors.fill: parent
+                    sourceComponent: card.floatingFooter ? floatingFooter : (card.integratedFooter ? integratedFooter : (card.centeredFooter ? centeredFooter : null))
                 }
 
             }
 
-            Rectangle {
-                anchors.fill: previewFrame
-                visible: !card.integratedFooter
-                z: 5
-                radius: previewFrame.radius
-                color: "transparent"
-                border.color: card.outlineColor
-                border.width: card.outlineWidth
-            }
-
-            Rectangle {
-                id: previewMask
-
-                anchors.fill: previewFrame
-                radius: previewFrame.radius
-                color: "black"
-                visible: false
-                layer.enabled: true
-                layer.smooth: true
+            layer.effect: MultiEffect {
+                maskEnabled: true
+                maskSource: frameMask
+                maskThresholdMin: 0.5
+                maskSpreadAtMin: 1
             }
 
         }
 
-        Item {
-            Layout.fillWidth: true
-            Layout.preferredHeight: Style.space(40)
-            visible: !card.overlayFooter
+        Rectangle {
+            id: frameMask
 
-            Loader {
-                anchors.fill: parent
-                sourceComponent: card.floatingFooter ? floatingFooter : (card.integratedFooter ? integratedFooter : (card.centeredFooter ? centeredFooter : null))
-            }
+            anchors.fill: parent
+            radius: frame.radius
+            color: "black"
+            visible: false
+            layer.enabled: true
+            layer.smooth: true
+        }
 
+        Rectangle {
+            anchors.fill: parent
+            z: 5
+            radius: frame.radius
+            color: "transparent"
+            border.color: card.outlineColor
+            border.width: card.outlineWidth
         }
 
     }

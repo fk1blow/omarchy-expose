@@ -1102,18 +1102,67 @@ Item {
             : "All workspaces";
     }
 
+    // The workspaces marked persistent in the Hyprland config, as
+    // [{ id, monitor }]. Quickshell's workspace list cannot be trusted for
+    // these: it only learns of a workspace from its startup snapshot or an
+    // event, and an empty persistent one that has never been visited is in
+    // neither - so the strip showed only the workspaces used since login.
+    property var persistentWorkspaces: []
+
+    function loadPersistentWorkspaces(text) {
+        var rules;
+        try {
+            rules = JSON.parse(text || "[]");
+        } catch (error) {
+            console.warn("expose: could not parse hyprctl workspacerules: " + error);
+            return;
+        }
+        var result = [];
+        for (var index = 0; index < (Array.isArray(rules) ? rules.length : 0); index++) {
+            var rule = rules[index];
+            var name = String(rule && rule.workspaceString || "");
+            if (!rule || rule.persistent !== true || !/^[1-9][0-9]*$/.test(name))
+                continue;
+            result.push({ id: Number(name), monitor: String(rule.monitor || "") });
+        }
+        root.persistentWorkspaces = result;
+    }
+
+    Process {
+        id: workspaceRulesProcess
+        command: ["hyprctl", "-j", "workspacerules"]
+        running: true
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: root.loadPersistentWorkspaces(text)
+        }
+    }
+
     function workspacesForScreen(screenName) {
         var revision = root.modelRevision;
         var all = Hyprland.workspaces ? Hyprland.workspaces.values : [];
         var perMonitor = root.multiMonitorMode === "per-monitor";
         var result = [];
+        var seen = {};
         for (var index = 0; index < all.length; index++) {
             var workspace = all[index];
             if (!workspace || Number(workspace.id) <= 0)
                 continue;
             if (perMonitor && !(workspace.monitor && String(workspace.monitor.name || "") === String(screenName || "")))
                 continue;
+            seen[Number(workspace.id)] = true;
             result.push(workspace);
+        }
+        // Stand-ins carry only id and name, which is all the strip, a click,
+        // a drop or a number key reads.
+        for (var rule = 0; rule < root.persistentWorkspaces.length; rule++) {
+            var persistent = root.persistentWorkspaces[rule];
+            if (seen[persistent.id])
+                continue;
+            if (perMonitor && persistent.monitor !== "" && persistent.monitor !== String(screenName || ""))
+                continue;
+            seen[persistent.id] = true;
+            result.push({ id: persistent.id, name: String(persistent.id) });
         }
         result.sort(function (a, b) { return Number(a.id) - Number(b.id); });
         return result;
@@ -1817,6 +1866,8 @@ Item {
                 root.selectedIndex = index;
         }
         function onRawEvent(event) {
+            if (event && event.name === "configreloaded")
+                workspaceRulesProcess.running = true;
             if (event && event.name === "custom" && event.data === "expose.window-overview:toggle")
                 root.toggle();
         }
